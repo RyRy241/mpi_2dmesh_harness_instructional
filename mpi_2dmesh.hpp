@@ -72,13 +72,29 @@ class AppState
 
 };  // class AppState
 
+// Width of the halo (ghost cell) layer added to each interior tile edge. The 3x3 Sobel
+// stencil reads one neighbor in each direction, so one layer is enough. Setting this
+// to 0 turns halos off and reproduces the base (seamed) version of the code.
+#define HALO_WIDTH 1
+
 class Tile2D
 {
    public:
    int xloc, yloc; // x,y location in global grid wrt (0,0) in global grid
 
    int width, height; // dimensions of tile base grid
+
+   // halo metadata: number of ghost cells on each side of the base grid. Set by
+   // computeMeshDecomposition() to HALO_WIDTH on edges shared with another tile, and to 0
+   // on edges that lie on the boundary of the global mesh.
    int ghost_xmin, ghost_xmax, ghost_ymin, ghost_ymax;
+
+   // size and origin of the padded region (base grid + halo). The inputBuffer holds the
+   // padded region; the outputBuffer holds only the base grid.
+   int paddedWidth(void)  const { return width  + ghost_xmin + ghost_xmax; }
+   int paddedHeight(void) const { return height + ghost_ymin + ghost_ymax; }
+   int paddedXloc(void)   const { return xloc - ghost_xmin; }
+   int paddedYloc(void)   const { return yloc - ghost_ymin; }
 
    int tileRank;      // rank id owner of this tile
 

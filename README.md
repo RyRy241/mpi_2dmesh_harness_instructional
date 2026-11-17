@@ -235,15 +235,34 @@ to Perlmutter. See https://docs.nersc.gov/connect/nx/ for more information.
   stride is the width of its destination buffer, so data lands in place with no extra copy.
 * `sobel_filtered_pixel()` and `do_sobel_filtering()` transplanted from HW5 `sobel_cpu.cpp`
   (serial, no OpenMP; double-precision accumulation; 1-pixel image border set to 0).
-* `sobelAllTiles()` calls `do_sobel_filtering(t->inputBuffer, t->outputBuffer, t->width, t->height)`
-  on every tile owned by the calling rank.
-* `scripts/data_movement.py`: computes #messages and bytes moved for every P / decomposition.
+* `sobelAllTiles()` calls `do_sobel_filtering()` on every tile owned by the calling rank.
+* `scripts/data_movement.py`: computes #messages and bytes moved for every P / decomposition
+  (including halo cells; `--halo 0` gives the counts for the version without halos).
 * `scripts/parse_timings.py`: parses slurm output into `timings.csv` and the 3 speedup charts.
 
-Note: tiles have no ghost/halo cells, so each tile treats its own edges as image borders.
-The output therefore has 1-pixel-wide zero seams along interior tile boundaries and will not
-match `data/correct_results_4x.dat` exactly at those pixels; all other pixels match a
-serial Sobel of the full image.
+## Extra credit: halo (ghost) cells
+The code exchanges one layer of halo cells so the output is correct at tile boundaries
+(no seams). It matches `data/correct_results_4x.dat` exactly (0 differing pixels) for all
+three decompositions at P = 4, 9, 16, 25, 36, 49, 64 and 81.
+1. `Tile2D` (mpi_2dmesh.hpp): `ghost_xmin/xmax/ymin/ymax` hold the number of halo cells on
+   each side of the base grid; helper methods `paddedWidth()`, `paddedHeight()`,
+   `paddedXloc()`, `paddedYloc()` give the size and origin of base grid + halo.
+2. `computeMeshDecomposition()`: after building the tiles, sets each `ghost_*` to
+   `HALO_WIDTH` (= 1, the reach of the 3x3 Sobel stencil) on edges shared with another tile,
+   and to 0 on edges on the boundary of the global mesh.
+3. `scatterAllTiles()`: sends (or, for rank 0, copies) the padded region, so each tile's
+   `inputBuffer` holds its base grid plus halo. Still one `MPI_Send` per tile.
+4. `do_sobel_filtering()`: reads the padded input and writes only the base grid to
+   `outputBuffer`. Only pixels on the border of the whole image are set to 0.
+5. `gatherAllTiles()`: unchanged; returns only the base grid (`outputBuffer` has no halo).
+
+Setting `#define HALO_WIDTH 0` in mpi_2dmesh.hpp turns halos off and reproduces the base
+version (1-pixel zero seams along interior tile boundaries).
+
+To check correctness after a run (from `build/`, with `module load python`):
+
+    srun -n 9 ./mpi_2dmesh -i ../data/zebra-gray-int8-4x -x 7112 -y 5146 -g 3
+    python3 -c "import numpy as np; a=np.fromfile('../data/processed-raw-int8-4x-cpu.dat',np.uint8); b=np.fromfile('../data/correct_results_4x.dat',np.uint8); print('differing pixels:', (a!=b).sum())"
 
 ## Input data
 Use the `data/` directory from the HW6 code harness

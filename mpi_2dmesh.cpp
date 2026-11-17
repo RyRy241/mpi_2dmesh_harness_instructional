@@ -226,6 +226,24 @@ computeMeshDecomposition(AppState *as, vector < vector < Tile2D > > *tileArray) 
          tileArray->push_back(tile_row);
       }
    }
+
+   // assign halo metadata for every tile, for all decomposition types: a tile gets
+   // HALO_WIDTH ghost cells on each edge that it shares with a neighboring tile, and none
+   // on edges that lie on the boundary of the global mesh (there is no data beyond those).
+   int global_width  = as->global_mesh_size[0];
+   int global_height = as->global_mesh_size[1];
+
+   for (int row=0; row < tileArray->size(); row++)
+   {
+      for (int col=0; col < (*tileArray)[row].size(); col++)
+      {
+         Tile2D *t = &((*tileArray)[row][col]);
+         t->ghost_xmin = (t->xloc > 0)                          ? HALO_WIDTH : 0;
+         t->ghost_xmax = (t->xloc + t->width  < global_width)  ? HALO_WIDTH : 0;
+         t->ghost_ymin = (t->yloc > 0)                          ? HALO_WIDTH : 0;
+         t->ghost_ymax = (t->yloc + t->height < global_height) ? HALO_WIDTH : 0;
+      }
+   }
 }
 
 void
@@ -492,18 +510,30 @@ sobel_filtered_pixel(float *s, int i, int j , int ncols, int nrows, float *gx, f
 }
 
 //
-// do_sobel_filtering(): apply the Sobel operator to every pixel of in[] (ncols x nrows,
-// row-major) and write the gradient magnitudes to out[] (same size).
+// do_sobel_filtering(): apply the Sobel operator to the base grid of a tile.
+//
+//   in[]  : the tile's padded input, in_ncols x in_nrows (base grid + halo), row-major
+//   out[] : the tile's base grid, out_ncols x out_nrows, row-major
+//   col_offset, row_offset : position of the base grid inside the padded input, i.e. the
+//           number of ghost cells on the tile's left (ghost_xmin) and top (ghost_ymin) edges
+//
+// Output pixel (i,j) is computed from input pixel (i+row_offset, j+col_offset), whose 3x3
+// neighborhood may include halo cells from neighboring tiles. sobel_filtered_pixel() returns
+// 0 only on the border of the padded input; because halos exist only on interior edges, that
+// border is the boundary of the global mesh, so only true image-border pixels are set to 0.
+// With no halo (offsets 0, in == out size) this is exactly the HW5 serial loop.
 //
 void
-do_sobel_filtering(float *in, float *out, int ncols, int nrows)
+do_sobel_filtering(float *in, float *out, int in_ncols, int in_nrows,
+                   int col_offset, int row_offset, int out_ncols, int out_nrows)
 {
    float Gx[] = {1.0, 0.0, -1.0, 2.0, 0.0, -2.0, 1.0, 0.0, -1.0};
    float Gy[] = {1.0, 2.0, 1.0, 0.0, 0.0, 0.0, -1.0, -2.0, -1.0};
 
-   for (int i = 0; i < nrows; i++)
-      for (int j = 0; j < ncols; j++)
-         out[(off_t)i*ncols + j] = sobel_filtered_pixel(in, i, j, ncols, nrows, Gx, Gy);
+   for (int i = 0; i < out_nrows; i++)
+      for (int j = 0; j < out_ncols; j++)
+         out[(off_t)i*out_ncols + j] = sobel_filtered_pixel(in, i+row_offset, j+col_offset,
+                                                            in_ncols, in_nrows, Gx, Gy);
 }
 
 
@@ -526,11 +556,13 @@ sobelAllTiles(int myrank, vector < vector < Tile2D > > & tileArray) {
             // v2. copy the input to the output, umodified
          //   std::copy(t->inputBuffer.begin(), t->inputBuffer.end(), t->outputBuffer.begin());
 #endif
-            // filter this rank's tile: the tile's inputBuffer was filled during the
-            // scatter phase, and its outputBuffer is sent back to rank 0 in the gather phase.
-            // Both buffers are t->width x t->height, row-major.
+            // filter this rank's tile: the tile's inputBuffer (base grid + halo, filled during
+            // the scatter phase) is read, and only its base grid is written to outputBuffer,
+            // which is sent back to rank 0 in the gather phase.
             do_sobel_filtering(t->inputBuffer.data(), t->outputBuffer.data(),
-                               t->width, t->height);
+                               t->paddedWidth(), t->paddedHeight(),  // padded input size
+                               t->ghost_xmin, t->ghost_ymin,         // base grid offset
+                               t->width, t->height);                 // base grid size
          }
       }
    }
@@ -553,17 +585,18 @@ scatterAllTiles(int myrank, vector < vector < Tile2D > > & tileArray, float *s, 
          {
             int fromRank=0;
 
-            // receive a tile's buffer 
-            t->inputBuffer.resize(t->width*t->height);
-            t->outputBuffer.resize(t->width*t->height);
+            // receive a tile's buffer: the input holds the base grid plus its halo cells,
+            // the output holds only the base grid
+            t->inputBuffer.resize((size_t)t->paddedWidth()*t->paddedHeight());
+            t->outputBuffer.resize((size_t)t->width*t->height);
 #if DEBUG_TRACE
             printf("scatterAllTiles() receive side:: t->tileRank=%d, myrank=%d, t->inputBuffer->size()=%d, t->outputBuffersize()=%d \n", t->tileRank, myrank, t->inputBuffer.size(), t->outputBuffer.size());
 #endif
 
-            recvStridedBuffer(t->inputBuffer.data(), t->width, t->height,
+            recvStridedBuffer(t->inputBuffer.data(), t->paddedWidth(), t->paddedHeight(),
                   0, 0,  // offset into the tile buffer: we want the whole thing
-                  t->width, t->height, // how much data coming from this tile
-                  fromRank, myrank); 
+                  t->paddedWidth(), t->paddedHeight(), // base grid + halo from this tile
+                  fromRank, myrank);
          }
          else if (myrank == 0)
          {
@@ -572,23 +605,27 @@ scatterAllTiles(int myrank, vector < vector < Tile2D > > & tileArray, float *s, 
                printf("scatterAllTiles() send side: t->tileRank=%d, myrank=%d, t->inputBuffer->size()=%d \n", t->tileRank, myrank, t->inputBuffer.size());
 #endif
 
+               // send the tile's base grid together with its halo cells: the padded region
+               // starts ghost_xmin/ghost_ymin cells before the base grid's origin
                sendStridedBuffer(s, // ptr to the buffer to send
                      global_width, global_height,  // size of the src buffer
-                     t->xloc, t->yloc, // offset into the send buffer
-                     t->width, t->height,  // size of the buffer to send,
+                     t->paddedXloc(), t->paddedYloc(), // offset into the send buffer
+                     t->paddedWidth(), t->paddedHeight(),  // size of the buffer to send,
                      myrank, t->tileRank);
             }
             else // rather then have rank 0 send to rank 0, just do a strided copy into a tile's input buffer
             {
-               t->inputBuffer.resize(t->width*t->height);
-               t->outputBuffer.resize(t->width*t->height);
+               t->inputBuffer.resize((size_t)t->paddedWidth()*t->paddedHeight());
+               t->outputBuffer.resize((size_t)t->width*t->height);
 
-               off_t s_offset=0, d_offset=0;
+               // copy the padded region (base grid + halo) row by row
+               off_t s_offset = (off_t)t->paddedYloc()*global_width + t->paddedXloc();
+               off_t d_offset = 0;
                float *d = t->inputBuffer.data();
 
-               for (int j=0;j<t->height;j++, s_offset+=global_width, d_offset+=t->width)
+               for (int j=0;j<t->paddedHeight();j++, s_offset+=global_width, d_offset+=t->paddedWidth())
                {
-                  memcpy((void *)(d+d_offset), (void *)(s+s_offset), sizeof(float)*t->width);
+                  memcpy((void *)(d+d_offset), (void *)(s+s_offset), sizeof(float)*t->paddedWidth());
                }
             }
          }
@@ -620,6 +657,8 @@ gatherAllTiles(int myrank, vector < vector < Tile2D > > & tileArray, float *d, i
          printf("gatherAllTiles(): t->tileRank=%d, myrank=%d, t->outputBuffer->size()=%d \n", t->tileRank, myrank, t->outputBuffer.size());
 #endif
 
+         // only the base grid is returned: outputBuffer is width x height and holds no
+         // halo cells, so gather moves exactly the same data as without halos
          if (myrank != 0 && t->tileRank == myrank)
          {
             // send the tile's output buffer to rank 0
