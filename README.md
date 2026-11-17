@@ -224,3 +224,60 @@ Mac-side Quartz configuration issue.
 
 If this issue affects you, you might want to consider trying NX to remote desktop
 to Perlmutter. See https://docs.nersc.gov/connect/nx/ for more information.
+
+# CP6 submission: how to build, run, and reproduce the results
+
+## What was added
+* `sendStridedBuffer()` / `recvStridedBuffer()` (mpi_2dmesh.cpp): each call builds an
+  `MPI_Type_vector(height, width, stride, MPI_FLOAT)` describing the strided tile
+  subregion and moves it with exactly **one** `MPI_Send` / `MPI_Recv`. The sender's stride is
+  the width of its source buffer (global image for scatter, tile for gather); the receiver's
+  stride is the width of its destination buffer, so data lands in place with no extra copy.
+* `sobel_filtered_pixel()` and `do_sobel_filtering()` transplanted from HW5 `sobel_cpu.cpp`
+  (serial, no OpenMP; double-precision accumulation; 1-pixel image border set to 0).
+* `sobelAllTiles()` calls `do_sobel_filtering(t->inputBuffer, t->outputBuffer, t->width, t->height)`
+  on every tile owned by the calling rank.
+* `scripts/data_movement.py`: computes #messages and bytes moved for every P / decomposition.
+* `scripts/parse_timings.py`: parses slurm output into `timings.csv` and the 3 speedup charts.
+
+Note: tiles have no ghost/halo cells, so each tile treats its own edges as image borders.
+The output therefore has 1-pixel-wide zero seams along interior tile boundaries and will not
+match `data/correct_results_4x.dat` exactly at those pixels; all other pixels match a
+serial Sobel of the full image.
+
+## Input data
+Use the `data/` directory from the HW6 code harness
+(`git clone https://github.com/SFSU-Bethel-Instructional/mpi_2dmesh_harness_instructional.git`).
+The runs use `data/zebra-gray-int8-4x` (7112 x 5146 bytes).
+
+## Build on Perlmutter
+    module load cpu
+    export CC=cc
+    export CXX=CC
+    export MPICH_GPU_SUPPORT_ENABLED=0
+    cd mpi_2dmesh_harness_instructional
+    mkdir build && cd build
+    cmake ..
+    make
+
+## Run the performance study (4 CPU nodes; P = 4..81; decomps 1, 2, 3)
+From `build/`:
+
+    sbatch ../scripts/run_script.sh ./mpi_2dmesh
+
+(or `../scripts/run_script_overrun.sh` if the allocation is exhausted). Each run prints the
+scatter, Sobel, and gather times measured on rank 0.
+
+A single run by hand, e.g. 16 ranks with tiled decomposition:
+
+    srun -n 16 ./mpi_2dmesh -i ../data/zebra-gray-int8-4x -x 7112 -y 5146 -g 3
+
+## Produce the charts and tables in the report
+From `build/` after the job finishes (needs `module load python` on Perlmutter):
+
+    python3 ../scripts/parse_timings.py slurm-XXXXXXX.out    # timings.csv + speedup_*.png
+    python3 ../scripts/data_movement.py                      # data_movement.csv + .tex table
+
+To view the output image:
+
+    python3 ../scripts/imshow.py ../data/processed-raw-int8-4x-cpu.dat 7112 5146

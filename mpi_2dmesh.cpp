@@ -379,14 +379,29 @@ sendStridedBuffer(float *srcBuf,
    int msgTag = 0;
 
    //
-   // ADD YOUR CODE HERE
-   // That performs sending of  data using MPI_Send(), going "fromRank" and to "toRank". The
-   // data to be sent is in srcBuf, which has width srcWidth, srcHeight.
-   // Your code needs to send a subregion of srcBuf, where the subregion is of size
-   // sendWidth by sendHeight values, and the subregion is offset from the origin of
-   // srcBuf by the values specificed by srcOffsetColumn, srcOffsetRow.
+   // Send a sendWidth x sendHeight subregion of srcBuf (row-major, srcWidth values per row),
+   // whose upper-left corner is at (srcOffsetColumn, srcOffsetRow), from fromRank to toRank.
    //
+   // The subregion is not contiguous in memory: it is sendHeight runs of sendWidth floats,
+   // each run starting srcWidth floats after the previous one. An MPI vector datatype
+   // describes exactly that layout, so the whole subregion goes out in ONE MPI_Send with
+   // no hand-written packing loop (MPI packs/streams the strided data internally).
+   //
+   // Messages per call: 1.   Payload per call: sendWidth*sendHeight*sizeof(float) bytes.
+   //
+   MPI_Datatype stridedBlock;
+   MPI_Type_vector(sendHeight,      // number of blocks (rows)
+                   sendWidth,       // floats per block (one row of the subregion)
+                   srcWidth,        // stride between block starts (one row of srcBuf)
+                   MPI_FLOAT, &stridedBlock);
+   MPI_Type_commit(&stridedBlock);
 
+   // address of the first value of the subregion inside srcBuf
+   float *subregionStart = srcBuf + (off_t)srcOffsetRow * srcWidth + srcOffsetColumn;
+
+   MPI_Send(subregionStart, 1, stridedBlock, toRank, msgTag, MPI_COMM_WORLD);
+
+   MPI_Type_free(&stridedBlock);
 }
 
 void
@@ -401,21 +416,90 @@ recvStridedBuffer(float *dstBuf,
    MPI_Status stat;
 
    //
-   // ADD YOUR CODE HERE
-   // That performs receiving of data using MPI_Recv(), coming "fromRank" and destined for
-   // "toRank". The size of the data that arrives will be of size expectedWidth by expectedHeight 
-   // values. This incoming data is to be placed into the subregion of dstBuf that has an origin
-   // at dstOffsetColumn, dstOffsetRow, and that is expectedWidth, expectedHeight in size.
+   // Receive expectedWidth x expectedHeight floats from fromRank and place them in the
+   // subregion of dstBuf (row-major, dstWidth values per row) whose upper-left corner is at
+   // (dstOffsetColumn, dstOffsetRow).
    //
+   // This mirrors sendStridedBuffer(): the receive side builds its own vector datatype whose
+   // stride is dstWidth, so MPI scatters the incoming rows directly into the right places in
+   // dstBuf. The sender's and receiver's datatypes have the same type signature
+   // (expectedWidth*expectedHeight MPI_FLOATs), which is all MPI requires to match them,
+   // even though their strides differ (e.g. global-image stride vs. tile stride).
+   //
+   MPI_Datatype stridedBlock;
+   MPI_Type_vector(expectedHeight,  // number of blocks (rows)
+                   expectedWidth,   // floats per block
+                   dstWidth,        // stride between block starts in dstBuf
+                   MPI_FLOAT, &stridedBlock);
+   MPI_Type_commit(&stridedBlock);
 
+   float *subregionStart = dstBuf + (off_t)dstOffsetRow * dstWidth + dstOffsetColumn;
+
+   MPI_Recv(subregionStart, 1, stridedBlock, fromRank, msgTag, MPI_COMM_WORLD, &stat);
+
+#if DEBUG_TRACE
+   // sanity check: did we get the number of floats we expected?
+   int nrecv=0;
+   MPI_Get_count(&stat, MPI_FLOAT, &nrecv);
+   recvSize[0] = expectedWidth; recvSize[1] = expectedHeight;
+   if (nrecv != recvSize[0]*recvSize[1])
+      printf("recvStridedBuffer(): rank %d expected %d floats from rank %d, got %d \n",
+            toRank, recvSize[0]*recvSize[1], fromRank, nrecv);
+#endif
+
+   MPI_Type_free(&stridedBlock);
 }
 
 
 //
-// ADD YOUR CODE HERE
-// that performs sobel filtering
-// suggest using your cpu code from HW5, no OpenMP parallelism 
+// Sobel filtering, transplanted from the HW5 sobel_cpu.cpp code (no OpenMP here: each
+// MPI rank runs this serially on its own tile).
 //
+
+//
+// sobel_filtered_pixel(): compute the Sobel gradient magnitude at row i, column j of
+// the row-major image s (ncols wide, nrows tall), using the 3x3 weights gx and gy.
+// Pixels on the one-pixel border return 0, since their 3x3 window would fall off the
+// edge of the buffer. Sums are accumulated in double precision, as in HW5, so that the
+// byte-converted output matches the reference image exactly.
+//
+float
+sobel_filtered_pixel(float *s, int i, int j , int ncols, int nrows, float *gx, float *gy)
+{
+   if (i <= 0 || j <= 0 || i >= nrows-1 || j >= ncols-1)
+      return 0.0f;
+
+   double Gx = 0.0, Gy = 0.0;
+
+   for (int di = -1; di <= 1; di++)
+   {
+      const float *srow = s + (off_t)(i+di)*ncols;
+      for (int dj = -1; dj <= 1; dj++)
+      {
+         int w = (di+1)*3 + (dj+1);   // index into the 3x3 weight arrays
+         double v = (double)srow[j+dj];
+         Gx += (double)gx[w] * v;
+         Gy += (double)gy[w] * v;
+      }
+   }
+
+   return (float)sqrt(Gx*Gx + Gy*Gy);
+}
+
+//
+// do_sobel_filtering(): apply the Sobel operator to every pixel of in[] (ncols x nrows,
+// row-major) and write the gradient magnitudes to out[] (same size).
+//
+void
+do_sobel_filtering(float *in, float *out, int ncols, int nrows)
+{
+   float Gx[] = {1.0, 0.0, -1.0, 2.0, 0.0, -2.0, 1.0, 0.0, -1.0};
+   float Gy[] = {1.0, 2.0, 1.0, 0.0, 0.0, 0.0, -1.0, -2.0, -1.0};
+
+   for (int i = 0; i < nrows; i++)
+      for (int j = 0; j < ncols; j++)
+         out[(off_t)i*ncols + j] = sobel_filtered_pixel(in, i, j, ncols, nrows, Gx, Gy);
+}
 
 
 void
@@ -437,8 +521,11 @@ sobelAllTiles(int myrank, vector < vector < Tile2D > > & tileArray) {
             // v2. copy the input to the output, umodified
          //   std::copy(t->inputBuffer.begin(), t->inputBuffer.end(), t->outputBuffer.begin());
 #endif
-         // ADD YOUR CODE HERE
-         // to call your sobel filtering code on each tile
+            // filter this rank's tile: the tile's inputBuffer was filled during the
+            // scatter phase, and its outputBuffer is sent back to rank 0 in the gather phase.
+            // Both buffers are t->width x t->height, row-major.
+            do_sobel_filtering(t->inputBuffer.data(), t->outputBuffer.data(),
+                               t->width, t->height);
          }
       }
    }
