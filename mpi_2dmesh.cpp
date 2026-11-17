@@ -396,7 +396,8 @@ sendStridedBuffer(float *srcBuf,
                    MPI_FLOAT, &stridedBlock);
    MPI_Type_commit(&stridedBlock);
 
-   // address of the first value of the subregion inside srcBuf
+   // MPI_Type_vector has no "initial offset" argument, so we apply the offset manually by
+   // pointing at the first value of the subregion inside srcBuf, then let MPI do the striding
    float *subregionStart = srcBuf + (off_t)srcOffsetRow * srcWidth + srcOffsetColumn;
 
    MPI_Send(subregionStart, 1, stridedBlock, toRank, msgTag, MPI_COMM_WORLD);
@@ -433,19 +434,23 @@ recvStridedBuffer(float *dstBuf,
                    MPI_FLOAT, &stridedBlock);
    MPI_Type_commit(&stridedBlock);
 
+   // manual offset to the first value of the destination subregion, as on the send side
    float *subregionStart = dstBuf + (off_t)dstOffsetRow * dstWidth + dstOffsetColumn;
 
    MPI_Recv(subregionStart, 1, stridedBlock, fromRank, msgTag, MPI_COMM_WORLD, &stat);
 
-#if DEBUG_TRACE
-   // sanity check: did we get the number of floats we expected?
-   int nrecv=0;
-   MPI_Get_count(&stat, MPI_FLOAT, &nrecv);
-   recvSize[0] = expectedWidth; recvSize[1] = expectedHeight;
-   if (nrecv != recvSize[0]*recvSize[1])
-      printf("recvStridedBuffer(): rank %d expected %d floats from rank %d, got %d \n",
-            toRank, recvSize[0]*recvSize[1], fromRank, nrecv);
-#endif
+   // check status to see how many items we received, and whether that is the number
+   // we expected (same check as the Lecture 24 subarray receiver example)
+   int rcount = 0;
+   MPI_Get_count(&stat, MPI_FLOAT, &rcount);
+   recvSize[0] = expectedWidth;
+   recvSize[1] = expectedHeight;
+   if (rcount != recvSize[0]*recvSize[1])
+   {
+      fprintf(stderr, "[rank %d] error: expected %d items from rank %d but received %d items \n",
+            toRank, recvSize[0]*recvSize[1], fromRank, rcount);
+      fflush(stderr);
+   }
 
    MPI_Type_free(&stridedBlock);
 }
@@ -771,9 +776,9 @@ int main(int ac, char *av[]) {
 
    if (as.myrank == 0) {
       printf("\n\nTiming results from rank 0: \n");
-      printf("\tScatter time:\t%6.4f (ms) \n", elapsed_scatter_time*1000.0);
-      printf("\tSobel time:\t%6.4f (ms) \n", elapsed_sobel_time*1000.0);
-      printf("\tGather time:\t%6.4f (ms) \n", elapsed_gather_time*1000.0);
+      printf("\tScatter time:\t%6.4f (ms) \n", elapsed_scatter_time.count()*1000.0);
+      printf("\tSobel time:\t%6.4f (ms) \n", elapsed_sobel_time.count()*1000.0);
+      printf("\tGather time:\t%6.4f (ms) \n", elapsed_gather_time.count()*1000.0);
    }
 
    MPI_Finalize();
