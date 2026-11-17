@@ -264,6 +264,15 @@ To check correctness after a run (from `build/`, with `module load python`):
     srun -n 9 ./mpi_2dmesh -i ../data/zebra-gray-int8-4x -x 7112 -y 5146 -g 3
     python3 -c "import numpy as np; a=np.fromfile('../data/processed-raw-int8-4x-cpu.dat',np.uint8); b=np.fromfile('../data/correct_results_4x.dat',np.uint8); print('differing pixels:', (a!=b).sum())"
 
+## Results folders
+* `ecresults/`: **halo version** (the submitted code, `HALO_WIDTH 1`), Perlmutter job 61479463.
+  These are the results used in the report: `timings.csv`, `speedup_*.png`,
+  `data_movement.csv` / `data_movement_table.tex`, the slurm log, and `halo_seams.png`
+  (before/after picture of the tile-boundary seams).
+* `results/`: **base version without halos** (`HALO_WIDTH 0`), Perlmutter job 61459125,
+  used in the report for comparison. Its data-movement table can be regenerated with
+  `python3 ../scripts/data_movement.py --halo 0`.
+
 ## Input data
 Use the `data/` directory from the HW6 code harness
 (`git clone https://github.com/SFSU-Bethel-Instructional/mpi_2dmesh_harness_instructional.git`).
