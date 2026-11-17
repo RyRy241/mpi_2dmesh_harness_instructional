@@ -2,6 +2,8 @@
 #SBATCH --constraint=cpu
 #SBATCH --nodes=4
 #SBATCH --time=00:30:00
+#SBATCH -A m3930
+#SBATCH -q regular
 
 export input="../data/zebra-gray-int8-4x"
 export xsize=7112
